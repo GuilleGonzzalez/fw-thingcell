@@ -1,7 +1,14 @@
 #include "Arduino.h"
 #define TINY_GSM_MODEM_SIM868
+//TODO #define TINY_GSM_SSL_CLIENT_AUTHENTICATION 
+//TODO #include <SSLClient.h>
+
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
+#include "LittleFS.h"
+
+//TODO use webinterface and littleFS to configure
+#include "credentials.h"
 
 #define PIN_PWRKEY 34
 #define PIN_AT_RX 14
@@ -18,14 +25,14 @@
 #define GSM_PIN ""
 #define PIN_LED 4
 
+
 /* Global variables ***********************************************************/
 
 static const char* apn      = "tm";
 static const char* gprsUser = "";
 static const char* gprsPass = "";
 
-static const char* mqtt_broker      = "ggonzalezm.ddns.net";
-static int mqtt_port                = 1883;
+
 static const char* topic_init       = "init";
 static const char* topic_led        = "led";
 static const char* topic_gps        = "gps";
@@ -36,7 +43,7 @@ static bool led_status = 0;
 static uint32_t last_time = 0;
 
 TinyGsm modem(SerialAT);
-TinyGsmClient client(modem);
+TinyGsmClientSecure client(modem);
 PubSubClient mqtt(client);
 
 /* Function prototypes ********************************************************/
@@ -44,6 +51,8 @@ PubSubClient mqtt(client);
 static void mqtt_cb(char* topic, byte* payload, unsigned int len);
 static bool mqtt_connect();
 static int get_gps_data(float* lat, float* lon, float* accuracy);
+static int sim_store_file(const char* filename, const char* store_name);
+
 
 /* Callbacks ******************************************************************/
 
@@ -77,8 +86,8 @@ static void mqtt_cb(char* topic, byte* payload, unsigned int len) {
 
 static bool mqtt_connect() {
 	SerialMon.print("Connecting to ");
-	SerialMon.print(mqtt_broker);
-	boolean status = mqtt.connect("ThingCellTest");
+	SerialMon.print(MQTT_HOST);
+	boolean status = mqtt.connect("ThingCellTest", MQTT_USER, MQTT_PASSWORD);
 	if (status == false) {
 		SerialMon.println(" Fail");
 		return false;
@@ -133,6 +142,48 @@ static int get_gps_data(float* lat, float* lon, float* accuracy)
 	return 1;
 }
 
+static int sim_store_file(const char* filename, const char* store_name)
+{
+	
+	File file = LittleFS.open(filename);
+	if(!file || file.isDirectory()){
+		Serial.println("- failed to open file for reading");
+		return 1;
+	}
+
+	String content = file.readString();
+	file.close();
+
+	char buff[100];
+	snprintf(buff, 100, "+FSCREATE=%s", store_name);
+	modem.sendAT(buff);
+	if (modem.waitResponse() != 1) {
+		return 1;
+	}
+
+	const int file_size = content.length();
+
+	snprintf(buff, 100, "+FSWRITE=%s,0,%d,10", store_name, file_size);
+	modem.sendAT(buff);
+	if (modem.waitResponse(GF(">")) != 1) {
+		return 1;
+	}
+
+	for (int i = 0; i < file_size; i++) {
+		char c = content.charAt(i);
+		modem.stream.write(c);
+	}
+
+	modem.stream.write(AT_NL);
+	modem.stream.flush();
+
+	if (modem.waitResponse(2000) != 1) {
+		return 1;
+	}
+
+	return 0;
+}
+
 /* Setup **********************************************************************/
 
 void setup()
@@ -148,13 +199,37 @@ void setup()
 	digitalWrite(PIN_PWRKEY, LOW);
 	delay(1500);
 	digitalWrite(PIN_PWRKEY, HIGH);
+	delay(6000);
+
+
+	if (!LittleFS.begin(true)) {
+		SerialMon.println("An error has occurred while mounting LittleFS");
+		delay(10000);
+		return;
+	}
+
+	SerialMon.println("LittleFS mounted successfully");
+
+	SerialMon.printf("Reading file: %s\r\n", "/ca.crt");
+
+	File file = LittleFS.open("/ca.crt");
+	if(!file || file.isDirectory()){
+		Serial.println("- failed to open file for reading");
+	} else {
+		while(file.available()) {
+			String line = file.readStringUntil('\n');
+			SerialMon.println(line);
+		}
+	}
+
+
+	file.close();
 
 	SerialAT.begin(115200, SERIAL_8N1, PIN_AT_RX, PIN_AT_TX);
 
 	SerialMon.println("Initializing modem...");
-	delay(6000);
-
 	modem.restart();
+	delay(20000);
 	String modemInfo = modem.getModemInfo();
 	SerialMon.print("Modem Info: ");
 	SerialMon.println(modemInfo);
@@ -171,36 +246,70 @@ void setup()
 	modem.enableGPS();
 	delay(5000);
 
-	SerialMon.println("MQTT init...");
-	mqtt.setServer(mqtt_broker, 1883);
-	mqtt.setCallback(mqtt_cb);
 
 	SerialMon.println("System initialized!");
 
-	SerialMon.print("Waiting for network...");
+	SerialMon.print("Waiting for network... ");
 	if (!modem.waitForNetwork()) {
-		SerialMon.println(" Fail");
+		SerialMon.println("Fail");
 		delay(10000);
 		return;
 	}
-	SerialMon.println(" Success");
+	SerialMon.println("Success");
 
 	if (modem.isNetworkConnected()) {
 		SerialMon.println("Network connected");
 	}
 
-	SerialMon.print("Connecting to ");
-	SerialMon.print(apn);
+	SerialMon.printf("Connecting to %s ", apn);
 	if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
-		SerialMon.println(" Fail");
+		SerialMon.println("Fail");
 		delay(10000);
 		return;
 	}
-	SerialMon.println(" Success");
+	SerialMon.println("Success");
 
 	if (modem.isGprsConnected()) {
 		SerialMon.println("GPRS connected");
 	}
+
+	SerialMon.print("Upload ca.crt file ");
+	//TODO check if file exist
+	int ret = sim_store_file("/ca.crt", "ca.crt");
+
+	if (ret != 0) {
+		SerialMon.println("Fail");
+		delay(10000);
+		return;
+	}
+
+	modem.sendAT("+SSLSETCERT=\"" "ca.crt" "\"");
+	if (modem.waitResponse() != 1) {
+		SerialMon.println("Fail");
+		delay(10000);
+		return;
+	}
+
+	if (modem.waitResponse(5000L, AT_NL "+SSLSETCERT:") != 1) {
+		SerialMon.println("Fail");
+		delay(10000);
+		return;
+	}
+
+	ret = modem.stream.readStringUntil('\n').toInt();
+
+	if (ret != 0) {
+		SerialMon.println("Fail");
+		delay(10000);
+		return;
+	}
+
+	SerialMon.println("Success");
+
+	SerialMon.println("MQTT init...");
+	mqtt.setServer(MQTT_HOST, MQTT_PORT);
+	mqtt.setCallback(mqtt_cb);
+
 
 	uint32_t timeout = millis();
 	while (client.connected() && millis() - timeout < 10000L) {

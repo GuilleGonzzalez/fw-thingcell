@@ -1,4 +1,4 @@
-# Thincell firmware
+# Thingcell firmware
 
 This repository contains the firmware to control **Thingcell**, a device with GPS, GPRS, WiFi and Bluetooth connectivity designed for tracking or controlling external devices through a cellular network.
 
